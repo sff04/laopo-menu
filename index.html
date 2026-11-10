@@ -1,0 +1,110 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, maximum-scale=1, user-scalable=no">
+<meta name="theme-color" content="#FF6B35">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
+<meta name="format-detection" content="telephone=no">
+<title>咱家小灶 · 点菜</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<div id="app" class="app">
+
+  <header class="topbar" id="topbar">
+    <div class="topbar-inner">
+      <div class="brand">
+        <div class="brand-mark" id="brandMark">🍚</div>
+        <div class="brand-text">
+          <h1 id="shopName">咱家小灶</h1>
+          <p id="shopSlogan">今天想吃点什么呀</p>
+        </div>
+      </div>
+      <div class="topbar-actions">
+        <button class="icon-btn" id="btnLuck" title="今天吃啥" aria-label="今天吃啥">🎲</button>
+        <button class="icon-btn" id="btnTheme" title="切换主题" aria-label="切换主题">🌙</button>
+      </div>
+    </div>
+  </header>
+
+  <main id="views" class="views">
+
+    <!-- 菜单 -->
+    <section class="view active" id="view-menu">
+      <div class="search-row">
+        <div class="search-box">
+          <span class="search-ico">🔍</span>
+          <input id="searchInput" type="search" placeholder="搜菜名、口味，比如「辣」" autocomplete="off">
+        </div>
+      </div>
+      <div class="cat-scroll" id="catBar"></div>
+      <div id="menuList" class="menu-list"></div>
+      <div id="menuEmpty" class="empty hidden">
+        <div class="empty-emoji">🍳</div>
+        <p class="empty-title">这里还空空的</p>
+        <p class="empty-sub">去「我的」把拿手菜加进来吧</p>
+      </div>
+    </section>
+
+    <!-- 点菜车 -->
+    <section class="view" id="view-cart">
+      <div id="cartBody"></div>
+    </section>
+
+    <!-- 心愿单 -->
+    <section class="view" id="view-wish">
+      <div id="wishBody"></div>
+    </section>
+
+    <!-- 订单 -->
+    <section class="view" id="view-orders">
+      <div id="ordersBody"></div>
+    </section>
+
+    <!-- 我的 / 设置 -->
+    <section class="view" id="view-me">
+      <div id="meBody"></div>
+    </section>
+
+    <!-- 菜品管理（二级页） -->
+    <section class="view" id="view-manage">
+      <div id="manageBody"></div>
+    </section>
+
+  </main>
+
+  <nav class="tabbar" id="tabbar">
+    <button class="tab active" data-view="menu">
+      <span class="tab-ico">🍜</span><span class="tab-txt">菜单</span>
+    </button>
+    <button class="tab" data-view="cart">
+      <span class="tab-ico">🧺<i class="badge hidden" id="cartBadge">0</i></span><span class="tab-txt">点菜车</span>
+    </button>
+    <button class="tab" data-view="wish">
+      <span class="tab-ico">💖</span><span class="tab-txt">心愿单</span>
+    </button>
+    <button class="tab" data-view="orders">
+      <span class="tab-ico">🧾</span><span class="tab-txt">订单</span>
+    </button>
+    <button class="tab" data-view="me">
+      <span class="tab-ico">👤</span><span class="tab-txt">我的</span>
+    </button>
+  </nav>
+
+  <button class="cart-fab hidden" id="cartFab">
+    <span>🧺</span>
+    <span class="fab-txt" id="fabTxt">已选 0 道</span>
+    <span class="fab-total" id="fabTotal">¥0</span>
+  </button>
+
+</div>
+
+<div id="sheetHost"></div>
+<div id="toast" class="toast"></div>
+
+<script src="app.js"></script>
+</body>
+</html>
