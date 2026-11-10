@@ -1155,7 +1155,7 @@
           save(true);
           c();
           renderers.orders();
-          toast('评价收到，谢谢老婆 💕', 'ok');
+          toast('评价收到，谢谢' + (state.settings.eaterName || '老婆') + ' 💕', 'ok');
         } }
       ],
       onMount: (el) => {
