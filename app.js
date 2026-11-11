@@ -92,6 +92,7 @@
       cart: [],
       orders: [],
       wishes: [],
+      sync: defaultSync(),
       settings: {
         shopName: '咱家小灶',
         slogan: '今天想吃点什么呀',
@@ -124,6 +125,8 @@
       if (!Array.isArray(state.orders)) state.orders = [];
       if (!Array.isArray(state.wishes)) state.wishes = [];
       if (!Array.isArray(state.settings.channels)) state.settings.channels = [];
+      if (!state.sync || typeof state.sync !== 'object') state.sync = defaultSync();
+      if (!state.sync.ts || typeof state.sync.ts !== 'object') state.sync.ts = { menu: 0, orders: 0, wish: 0, meta: 0 };
       if (!Array.isArray(state.settings.cats) || !state.settings.cats.length) state.settings.cats = CATS.slice();
       // 旧数据迁移：分类去掉「招牌 / 甜品 / 饮品」，原招牌菜归入荤菜
       const removed = ['招牌', '甜品', '饮品'];
@@ -141,17 +144,320 @@
   }
 
   let saveTimer = null;
-  function save(immediate) {
+  function save(immediate, noBump) {
     const run = () => {
       try {
+        // 刷新同步分区时间戳（joinSync 等场景用 noBump 跳过，让云端数据优先）
+        if (state.sync && state.sync.ts && !noBump) {
+          const t = Date.now();
+          state.sync.ts.menu = t; state.sync.ts.orders = t; state.sync.ts.wish = t; state.sync.ts.meta = t;
+        }
         localStorage.setItem(STORE_KEY, JSON.stringify(state));
       } catch (e) {
         toast('保存失败，浏览器存储可能已满', 'err');
       }
+      scheduleSyncPush();
     };
     if (immediate) { clearTimeout(saveTimer); run(); return; }
     clearTimeout(saveTimer);
     saveTimer = setTimeout(run, 220);
+  }
+
+  /* ================= 双机同步（菜单/订单/心愿单跨设备互通） ================= */
+  const SYNC_API = 'https://textdb.online';
+  let syncing = false;
+  let syncPushTimer = null;
+  let syncInterval = null;
+
+  function defaultSync() {
+    return { key: '', on: false, lastAt: 0, ts: { menu: 0, orders: 0, wish: 0, meta: 0 } };
+  }
+  function syncKeyOk(k) { return /^[0-9a-zA-Z\-_]{6,60}$/.test(k); }
+  function randSyncKey() {
+    let s = 'lp';
+    const chars = 'abcdefghijklmnopqrstuvwxyz0123456789';
+    for (let i = 0; i < 24; i++) s += chars.charAt(Math.floor(Math.random() * chars.length));
+    return s;
+  }
+
+  function buildSyncPayload() {
+    // 相册选的照片（data: 链接）体积太大且属于本机，不同步
+    const menu = state.menu.map((m) => Object.assign({}, m, {
+      img: (m.img && m.img.indexOf('data:') === 0) ? '' : (m.img || '')
+    }));
+    return JSON.stringify({
+      v: 1,
+      ts: state.sync.ts,
+      menu: menu,
+      orders: state.orders.slice(0, 200),
+      wishes: state.wishes.slice(0, 200),
+      meta: {
+        shopName: state.settings.shopName, slogan: state.settings.slogan,
+        ownerName: state.settings.ownerName, eaterName: state.settings.eaterName,
+        cats: state.settings.cats, showPrice: state.settings.showPrice
+      }
+    });
+  }
+
+  function sameJson(a, b) { return JSON.stringify(a) === JSON.stringify(b); }
+
+  // 把云端数据合并进本地。返回是否有实际内容变化
+  function mergeSync(remote) {
+    let touched = false;
+    const rts = remote.ts || {};
+    const lts = state.sync.ts;
+    // 菜单：时间戳新的整体生效，但保留本机从相册选的照片
+    if (Array.isArray(remote.menu) && remote.menu.length && (rts.menu || 0) > (lts.menu || 0)) {
+      if (!sameJson(remote.menu, state.menu)) {
+        const localById = {};
+        state.menu.forEach((m) => { localById[m.id] = m; });
+        remote.menu.forEach((m) => {
+          const lm = localById[m.id];
+          if (lm && lm.img && lm.img.indexOf('data:') === 0 && (!m.img || m.img.indexOf('data:') !== 0)) m.img = lm.img;
+        });
+        state.menu = remote.menu;
+        touched = true;
+      }
+    }
+    // 店铺设置
+    if (remote.meta && (rts.meta || 0) > (lts.meta || 0)) {
+      const cur = { shopName: state.settings.shopName, slogan: state.settings.slogan, ownerName: state.settings.ownerName, eaterName: state.settings.eaterName, cats: state.settings.cats, showPrice: state.settings.showPrice };
+      if (!sameJson(remote.meta, cur)) {
+        ['shopName', 'slogan', 'ownerName', 'eaterName', 'showPrice'].forEach((k) => { if (remote.meta[k] !== undefined) state.settings[k] = remote.meta[k]; });
+        if (Array.isArray(remote.meta.cats) && remote.meta.cats.length) state.settings.cats = remote.meta.cats;
+        touched = true;
+      }
+    }
+    // 订单：按 id 并集（两边都能看到对方的单和评价）
+    if (Array.isArray(remote.orders) && remote.orders.length) {
+      const seen = {};
+      state.orders.forEach((o) => { seen[o.id || o.no] = o; });
+      let added = false;
+      remote.orders.forEach((o) => {
+        const k = o.id || o.no;
+        if (!seen[k]) { state.orders.push(o); seen[k] = o; added = true; }
+        else if (o.rated && !seen[k].rated) { Object.assign(seen[k], o); added = true; }
+      });
+      if (added) { state.orders.sort((a, b) => (b.ts || 0) - (a.ts || 0)); touched = true; }
+    }
+    // 心愿单：按 id 并集
+    if (Array.isArray(remote.wishes) && remote.wishes.length) {
+      const seen = {};
+      state.wishes.forEach((w) => { seen[w.id] = 1; });
+      let added = false;
+      remote.wishes.forEach((w) => { if (!seen[w.id]) { state.wishes.push(w); seen[w.id] = 1; added = true; } });
+      if (added) { state.wishes.sort((a, b) => (b.ts || 0) - (a.ts || 0)); touched = true; }
+    }
+    // 时间戳取双方较大值
+    ['menu', 'orders', 'wish', 'meta'].forEach((k) => { lts[k] = Math.max(lts[k] || 0, rts[k] || 0); });
+    return touched;
+  }
+
+  function rerenderAll() {
+    ['menu', 'cart', 'orders', 'wish', 'me'].forEach((v) => {
+      try { if (renderers[v]) renderers[v](); } catch (e) { /* 忽略 */ }
+    });
+  }
+
+  function syncPull() {
+    if (!state.sync.on || !state.sync.key || syncing) return Promise.resolve(false);
+    syncing = true;
+    return fetch(SYNC_API + '/' + state.sync.key + '?t=' + Date.now(), { cache: 'no-store' })
+      .then((r) => r.text())
+      .then((txt) => {
+        let remote = null;
+        try { remote = JSON.parse(txt); } catch (e) { return false; }
+        if (!remote || remote.v !== 1) return false;
+        const touched = mergeSync(remote);
+        state.sync.lastAt = Date.now();
+        if (touched) {
+          save(true);
+          rerenderAll();
+          toast('已同步' + (state.settings.eaterName || '老婆') + '那边的最新数据', 'ok');
+        }
+        return true;
+      })
+      .catch(() => false)
+      .then((ok) => { syncing = false; return ok; });
+  }
+
+  let syncPendingPush = false;
+  function syncPush() {
+    if (!state.sync.on || !state.sync.key) return Promise.resolve(false);
+    // 正在同步时不丢弃改动，记下来完成后立刻补推
+    if (syncing) { syncPendingPush = true; return Promise.resolve(false); }
+    const body = 'key=' + encodeURIComponent(state.sync.key) + '&value=' + encodeURIComponent(buildSyncPayload());
+    const opts = { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: body };
+    syncing = true;
+    const done = (ok) => {
+      syncing = false;
+      state.sync.lastAt = Date.now();
+      if (syncPendingPush) { syncPendingPush = false; setTimeout(() => { syncPush(); }, 600); }
+      if (!ok) toast('同步暂时没成功，改动后会自动重试', 'err');
+      return ok;
+    };
+    return fetch(SYNC_API + '/update', opts)
+      .then((r) => done(r.ok))
+      .catch(() => fetch(SYNC_API + '/update', { method: 'POST', mode: 'no-cors', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: body })
+        .then(() => done(true), () => done(false)));
+  }
+
+  function scheduleSyncPush() {
+    if (!state.sync || !state.sync.on || !state.sync.key) return;
+    clearTimeout(syncPushTimer);
+    syncPushTimer = setTimeout(() => { syncPush(); }, 2500);
+  }
+
+  function startSyncLoop() {
+    if (syncInterval) clearInterval(syncInterval);
+    if (!state.sync.on || !state.sync.key) return;
+    syncInterval = setInterval(() => { syncPull(); }, 30000);
+  }
+
+  function stopSync() {
+    if (syncInterval) clearInterval(syncInterval);
+    syncInterval = null;
+    clearTimeout(syncPushTimer);
+    state.sync = defaultSync();
+    save(true);
+    renderers.me();
+    toast('已断开同步，本机数据不受影响');
+  }
+
+  function syncInviteLink() { return baseUrl() + '#j=' + state.sync.key; }
+
+  function showInviteSheet() {
+    const link = syncInviteLink();
+    openSheet({
+      title: '把同步邀请发给TA',
+      sub: '对方点开一次，两台手机的数据就接通了',
+      body:
+        '<div class="copy-box" id="syncInvite">' + esc(link) + '</div>' +
+        '<p class="hint">链接里只有一个随机同步码，不含推送密钥，可以放心发。断开同步前这个链接一直有效。</p>',
+      actions: [
+        { text: '复制邀请链接', cls: 'btn-primary', onClick: async (c) => {
+            const okc = await copyText(link);
+            toast(okc ? '已复制，发给TA吧' : '复制失败，长按上面的文字复制', okc ? 'ok' : 'err');
+          } },
+        { text: '关闭', cls: '', onClick: (c) => c() }
+      ]
+    });
+  }
+
+  function createSync() {
+    state.sync = defaultSync();
+    state.sync.key = randSyncKey();
+    state.sync.on = true;
+    save(true);
+    renderers.me();
+    startSyncLoop();
+    showInviteSheet();
+    syncPush().then((ok) => { if (ok) toast('云端已就绪，把邀请链接发给TA吧', 'ok'); });
+  }
+
+  function joinSync(key) {
+    state.sync = defaultSync();
+    state.sync.key = key;
+    state.sync.on = true;
+    save(true, true);
+    startSyncLoop();
+    syncPull().then((ok) => {
+      renderers.me();
+      if (!ok) syncPush();
+      openSheet({
+        title: '同步已接通 ✅',
+        sub: '菜单、订单、心愿单从此和' + (state.settings.ownerName || '老公') + '那边保持一致',
+        body:
+          '<div style="text-align:center;padding:8px 0 12px">' +
+            '<div style="font-size:52px">🔄</div>' +
+            '<p style="font-size:14px;font-weight:800;margin-top:4px">以后不用再发菜单链接了</p>' +
+            '<p style="font-size:12.5px;color:var(--ink-3);margin-top:8px">谁改了菜、加了心愿、下了单，另一边最多半分钟就自动更新</p>' +
+          '</div>',
+        actions: [{ text: '太好了', cls: 'btn-primary', onClick: (c) => c() }]
+      });
+    });
+  }
+
+  function syncStatusText() {
+    if (!state.sync.on) return '';
+    if (!state.sync.lastAt) return '等待首次同步';
+    const m = Math.floor((Date.now() - state.sync.lastAt) / 60000);
+    return m < 1 ? '刚刚同步过' : (m < 60 ? m + ' 分钟前同步' : Math.floor(m / 60) + ' 小时前同步');
+  }
+
+  function openSyncSheet() {
+    const sy = state.sync;
+    if (!sy.on) {
+      const s = openSheet({
+        title: '双机同步',
+        sub: '菜单、订单、心愿单在两台手机之间自动互通',
+        body:
+          '<div class="list-row" style="border:1px solid var(--line);border-radius:12px;margin-bottom:10px" id="syncCreate"><span class="lr-ico">🏠</span>' +
+            '<div class="lr-main"><div class="lr-title">创建同步（第一次配置用这个）</div><div class="lr-sub">生成邀请链接发给对方</div></div><span class="lr-value">›</span></div>' +
+          '<div class="list-row" style="border:1px solid var(--line);border-radius:12px" id="syncJoin"><span class="lr-ico">🔗</span>' +
+            '<div class="lr-main"><div class="lr-title">加入对方的同步</div><div class="lr-sub">粘贴收到的邀请链接</div></div><span class="lr-value">›</span></div>' +
+          '<p class="hint" style="margin-top:12px">开启后：谁改了菜单、下了单、加了心愿，对方最多半分钟就能看到。推送密钥不参与同步，每台设备各自配置。</p>',
+        actions: [{ text: '取消', cls: '', onClick: (c) => c() }],
+        onMount: (el) => {
+          $('#syncCreate', el).addEventListener('click', () => { s.close(); setTimeout(createSync, 260); });
+          $('#syncJoin', el).addEventListener('click', () => {
+            s.close();
+            setTimeout(() => {
+              openSheet({
+                title: '加入同步',
+                sub: '粘贴对方发给你的邀请链接',
+                body: '<div class="field"><label>邀请链接或同步码</label><input class="input" id="syncKeyIn" placeholder="https://…#j=lp…" autocapitalize="off" spellcheck="false"></div>',
+                actions: [
+                  { text: '取消', cls: '', onClick: (c) => c() },
+                  { text: '接通', cls: 'btn-primary', onClick: (c, el2) => {
+                      let v = ($('#syncKeyIn', el2).value || '').trim();
+                      const m = v.match(/#j=([0-9a-zA-Z\-_]+)/);
+                      if (m) v = m[1];
+                      if (!syncKeyOk(v)) { toast('这个链接/同步码不对，检查一下', 'err'); return; }
+                      c();
+                      joinSync(v);
+                    } }
+                ]
+              });
+            }, 260);
+          });
+        }
+      });
+      return;
+    }
+    // 已开启
+    const s = openSheet({
+      title: '双机同步',
+      sub: syncStatusText() + ' · 同步码 ' + sy.key.slice(0, 8) + '…',
+      body:
+        '<div class="list-row" style="border:1px solid var(--line);border-radius:12px;margin-bottom:10px" id="syncNow"><span class="lr-ico">⚡</span>' +
+          '<div class="lr-main"><div class="lr-title">立即同步</div><div class="lr-sub">马上拉取对方的最新数据</div></div><span class="lr-value">›</span></div>' +
+        '<div class="list-row" style="border:1px solid var(--line);border-radius:12px;margin-bottom:10px" id="syncInviteAgain"><span class="lr-ico">📤</span>' +
+          '<div class="lr-main"><div class="lr-title">邀请链接</div><div class="lr-sub">新手机或换设备时用</div></div><span class="lr-value">›</span></div>' +
+        '<div class="list-row" style="border:1px solid var(--line);border-radius:12px" id="syncOff"><span class="lr-ico">🚫</span>' +
+          '<div class="lr-main"><div class="lr-title" style="color:var(--red)">断开同步</div><div class="lr-sub">停用后数据只存本机</div></div><span class="lr-value">›</span></div>',
+      actions: [{ text: '关闭', cls: '', onClick: (c) => c() }],
+      onMount: (el) => {
+        $('#syncNow', el).addEventListener('click', (ev) => {
+          ev.currentTarget.querySelector('.lr-title').textContent = '同步中…';
+          syncPull().then((ok) => { renderers.me(); toast(ok ? '已是最新' : '网络不太好，稍后再试', ok ? 'ok' : 'err'); });
+        });
+        $('#syncInviteAgain', el).addEventListener('click', () => { s.close(); setTimeout(showInviteSheet, 260); });
+        $('#syncOff', el).addEventListener('click', () => {
+          s.close();
+          setTimeout(() => {
+            openSheet({
+              title: '断开同步？',
+              body: '<p class="hint">断开后两台手机的数据不再互通，本机已有的数据保持不变。之后可以随时重新开启。</p>',
+              actions: [
+                { text: '再想想', cls: '', onClick: (c) => c() },
+                { text: '断开', cls: 'btn-primary', onClick: (c) => { c(); stopSync(); } }
+              ]
+            });
+          }, 260);
+        });
+      }
+    });
   }
 
   /* ================= 提示与弹层 ================= */
@@ -1206,6 +1512,7 @@
 
       '<div class="sec-title"><h2>数据与外观</h2></div>' +
       '<div class="card" style="padding:0 14px">' +
+        '<div class="list-row" id="goSync"><span class="lr-ico">🔄</span><div class="lr-main"><div class="lr-title">双机同步</div><div class="lr-sub">' + (state.sync.on ? esc(syncStatusText()) + '，菜单/订单/心愿单自动互通' : '两台手机数据互通，强烈推荐开启') + '</div></div><span class="lr-value" style="color:' + (state.sync.on ? 'var(--green)' : 'var(--red)') + '">' + (state.sync.on ? '同步中 ›' : '未开启 ›') + '</span></div>' +
         '<div class="list-row" id="goShare"><span class="lr-ico">📤</span><div class="lr-main"><div class="lr-title">把菜单分享给TA</div><div class="lr-sub">生成链接，对方打开即可同步菜单</div></div><span class="lr-value">›</span></div>' +
         '<div class="list-row" id="goBackup"><span class="lr-ico">💾</span><div class="lr-main"><div class="lr-title">备份与恢复</div><div class="lr-sub">导出文件，换手机也不丢</div></div><span class="lr-value">›</span></div>' +
         '<div class="list-row" id="goPrice"><span class="lr-ico">💰</span><div class="lr-main"><div class="lr-title">显示价格</div><div class="lr-sub">关掉就只谈心不谈钱</div></div><button class="switch' + (s.showPrice ? ' on' : '') + '" id="priceSwitch"></button></div>' +
@@ -1213,12 +1520,13 @@
         '<div class="list-row" id="clearOrders"><span class="lr-ico">🧹</span><div class="lr-main"><div class="lr-title" style="color:var(--red)">清空订单记录</div><div class="lr-sub">小心，删了找不回来</div></div><span class="lr-value">›</span></div>' +
       '</div>' +
 
-      '<p class="hint" style="text-align:center;margin:22px 0 10px">' + esc(s.shopName || '咱家小灶') + ' · 只为一个人做菜 ❤️<br>数据都存在这台设备上，记得偶尔备份</p>';
+      '<p class="hint" style="text-align:center;margin:22px 0 10px">' + esc(s.shopName || '咱家小灶') + ' · 只为一个人做菜 ❤️<br>' + (state.sync.on ? '双机同步已开启，数据自动互通' : '数据都存在这台设备上，记得偶尔备份') + '</p>';
 
     $('#editShop').addEventListener('click', openShopSettings);
     $('#goManage').addEventListener('click', () => go('manage'));
     $('#goPush').addEventListener('click', openPushSettings);
     $('#goCats').addEventListener('click', openCatSettings);
+    $('#goSync').addEventListener('click', openSyncSheet);
     $('#goShare').addEventListener('click', openShareSheet);
     $('#goBackup').addEventListener('click', openBackupSheet);
     $('#goTheme').addEventListener('click', () => {
@@ -1879,6 +2187,17 @@
 
   function handleShareHash() {
     const h = location.hash || '';
+    // #j= 双机同步邀请链接（对方点开一次即接通数据同步）
+    if (h.indexOf('#j=') === 0) {
+      const k = h.slice(3);
+      history.replaceState(null, '', baseUrl());
+      if (!syncKeyOk(k)) {
+        toast('这个同步链接不对，让TA重新生成一个', 'err');
+        return false;
+      }
+      joinSync(k);
+      return true;
+    }
     // #b= 绑定推送渠道（老板把自己的推送密钥一次性写进对方设备）
     if (h.indexOf('#b=') === 0) {
       try {
@@ -1973,6 +2292,11 @@
     go('menu');
     const shared = handleShareHash();
     window.addEventListener('hashchange', () => { handleShareHash(); });
+    // 已开启同步：拉一次最新数据，并启动定时同步
+    if (state.sync && state.sync.on && state.sync.key) {
+      startSyncLoop();
+      setTimeout(() => { syncPull(); }, 1200);
+    }
     if (!shared) {
       // 首次使用给个温和提示（只弹一次）
       if (!state.settings.seenWelcome) {
